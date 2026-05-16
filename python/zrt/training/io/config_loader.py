@@ -129,6 +129,7 @@ def _resolve_model(model_ref: str | dict) -> ModelSpec:
 
 
 def _parse_model(d: dict) -> ModelSpec:
+    d = _expand_quant_preset(d)
     layers_str = d.get("layers", [])
     layers = _parse_layers(layers_str)
 
@@ -183,6 +184,14 @@ def _parse_model(d: dict) -> ModelSpec:
         grad_dtype=_parse_dtype(d.get("grad_dtype", "fp32")),
         master_dtype=_parse_dtype(d.get("master_dtype", "fp32")),
         act_dtype=_parse_dtype(d.get("act_dtype", "bf16")),
+        # NEW per-component dtypes (Task 3 added the ModelSpec fields)
+        attn_compute_dtype=_parse_dtype(d.get("attn_compute_dtype", "bf16")),
+        shared_expert_compute_dtype=_parse_dtype(d.get("shared_expert_compute_dtype", "bf16")),
+        routed_expert_compute_dtype=_parse_dtype(d.get("routed_expert_compute_dtype", "bf16")),
+        routed_expert_weight_dtype=_parse_dtype(d["routed_expert_weight_dtype"]) if "routed_expert_weight_dtype" in d else None,
+        attn_act_dtype=_parse_dtype(d["attn_act_dtype"]) if "attn_act_dtype" in d else None,
+        moe_act_dtype=_parse_dtype(d["moe_act_dtype"]) if "moe_act_dtype" in d else None,
+        routed_expert_grad_dtype=_parse_dtype(d.get("routed_expert_grad_dtype", "fp32")),
         # normalization
         norm_kind=d.get("norm_kind", "rmsnorm"),
         model_type=d.get("model_type", "default"),
@@ -305,12 +314,76 @@ def _parse_layers(layers_spec) -> list[LayerKind]:
     return []
 
 
+_QUANT_PRESETS: dict[str, dict[str, str]] = {
+    "bf16_baseline": {
+        "attn_compute_dtype": "bf16",
+        "routed_expert_compute_dtype": "bf16",
+        "routed_expert_weight_dtype": "bf16",
+        "shared_expert_compute_dtype": "bf16",
+        "routed_expert_grad_dtype": "fp32",
+        "act_dtype": "bf16",
+    },
+    "fp8_mixed": {   # DeepSeek-V3 style
+        "attn_compute_dtype": "bf16",
+        "routed_expert_compute_dtype": "fp8_e4m3",
+        "routed_expert_weight_dtype": "bf16",
+        "shared_expert_compute_dtype": "bf16",
+        "routed_expert_grad_dtype": "fp32",
+        "act_dtype": "bf16",
+        "moe_act_dtype": "fp8_e4m3",
+    },
+    "deepseek_v4_fp8_fp4": {   # V4 main path
+        "attn_compute_dtype": "bf16",
+        "routed_expert_compute_dtype": "fp8_e4m3",
+        "routed_expert_weight_dtype": "fp4",
+        "shared_expert_compute_dtype": "bf16",
+        "routed_expert_grad_dtype": "fp32",
+        "act_dtype": "bf16",
+        "moe_act_dtype": "fp8_e4m3",
+    },
+    "deepseek_v4_full_fp8": {   # V4 with FP8 shared experts
+        "attn_compute_dtype": "bf16",
+        "routed_expert_compute_dtype": "fp8_e4m3",
+        "routed_expert_weight_dtype": "fp4",
+        "shared_expert_compute_dtype": "fp8_e4m3",
+        "routed_expert_grad_dtype": "fp32",
+        "act_dtype": "bf16",
+        "moe_act_dtype": "fp8_e4m3",
+        "attn_act_dtype": "bf16",
+    },
+}
+
+
+def _expand_quant_preset(d: dict) -> dict:
+    """Expand a ``quant_preset`` shorthand into explicit dtype fields.
+
+    Explicit fields in ``d`` override preset values. Removes the
+    ``quant_preset`` key from the returned mapping. Returns a new dict
+    (does not mutate input).
+    """
+    preset_name = d.get("quant_preset")
+    out = {k: v for k, v in d.items() if k != "quant_preset"}
+    if preset_name is None:
+        return out
+    if preset_name not in _QUANT_PRESETS:
+        raise KeyError(
+            f"unknown quant_preset {preset_name!r}; "
+            f"valid options: {sorted(_QUANT_PRESETS)}"
+        )
+    for key, val in _QUANT_PRESETS[preset_name].items():
+        out.setdefault(key, val)
+    return out
+
+
 def _parse_dtype(s: str) -> Dtype:
     s = s.lower().strip()
     mapping = {
         "fp32": Dtype.FP32, "float32": Dtype.FP32,
         "bf16": Dtype.BF16, "bfloat16": Dtype.BF16,
         "fp16": Dtype.FP16, "float16": Dtype.FP16,
-        "fp8": Dtype.FP8, "float8": Dtype.FP8,
+        "fp8": Dtype.FP8_E4M3, "float8": Dtype.FP8_E4M3,
+        "fp8_e4m3": Dtype.FP8_E4M3,
+        "fp8_e5m2": Dtype.FP8_E5M2,
+        "fp4": Dtype.FP4, "mxfp4": Dtype.FP4, "nvfp4": Dtype.FP4,
     }
     return mapping.get(s, Dtype.BF16)
