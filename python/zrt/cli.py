@@ -108,6 +108,12 @@ def main() -> None:
         default=False,
         help="Automatically select the first dense and first sparse (MoE) layer.",
     )
+    _layer_group.add_argument(
+        "--full-trace",
+        action="store_true",
+        default=False,
+        help="Trace all layers of the model (ignores --layers and LayerProfile sampling).",
+    )
 
     # ── Phases ────────────────────────────────────────────────────────────────
     parser.add_argument(
@@ -338,7 +344,8 @@ def main() -> None:
                 f"got: {args.target_layers!r}"
             )
 
-    effective_auto_layers = args.auto_layers or (target_layers is None)
+    effective_auto_layers = args.auto_layers or (target_layers is None and not args.full_trace)
+    full_trace = args.full_trace
 
     effective_platform = args.platform
     if effective_platform == "generic" and args.hw:
@@ -367,6 +374,7 @@ def main() -> None:
         graph_mode=args.graph_mode,
         gradient_checkpointing=args.gradient_checkpointing,
         infer_profile=infer_profile,
+        full_trace=full_trace,
     )
 
     if args.cp_kind != "none" or args.cp > 1:

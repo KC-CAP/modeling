@@ -79,6 +79,141 @@ _NAMES: dict[str, str] = {
 }
 
 
+def _emit_template_replicas(
+    events: list[dict],
+    zero_dur_ops: list[dict],
+    ops: list,
+    base: float,
+    window_dur: float,
+    template_dur: float,
+    stage: int,
+    mb: int,
+    phase: str,
+    replicate: bool,
+    mult: float,
+    *,
+    fwd_lat: float = 0.0,
+    tid_offset: int = 0,
+) -> None:
+    """Emit *ops* as replicated template copies filling *window_dur*.
+
+    The DAGScheduler *ops* represent one pass through the traced
+    representative layers.  When the PP grid window is larger than
+    *template_dur* (e.g. 1-2 traced layers in a 15-layer stage window),
+    the template is replicated to fill the gap::
+
+         window=[base … base+window_dur]
+           [r=0: template] [r=1: template] [r=2: template] …
+
+    Each replica gets ``L{replica_index}:`` prefixed to the op name so
+    the trace viewer shows distinct per-layer blocks.
+
+    Operators with zero or negative latency_us are skipped and collected
+    in *zero_dur_ops* for later analysis.
+    """
+    if template_dur <= 0 or window_dur <= 0:
+        return
+
+    total_op_latency = sum(op.latency_us for op in ops)
+    fill_ratio = total_op_latency / max(template_dur, 1.0)
+    if (len(ops) < 5 and fill_ratio < 0.02) or fill_ratio < 0.005:
+        _emit_copy(events, zero_dur_ops, ops, base, 0.0, stage, mb, phase,
+                   replicate, mult, fwd_lat, 0,
+                   tid_offset=tid_offset)
+        return
+
+    replicas = window_dur / template_dur
+    full_copies = int(replicas)
+    remainder = replicas - full_copies
+
+    if len(ops) < 5 and full_copies > 50:
+        _emit_copy(events, zero_dur_ops, ops, base, 0.0, stage, mb, phase,
+                   replicate, mult, fwd_lat, 0,
+                   tid_offset=tid_offset)
+        return
+
+    for r in range(full_copies):
+        _emit_copy(events, zero_dur_ops, ops, base, r * template_dur, stage, mb, phase,
+                   replicate, mult, fwd_lat, r, tid_offset=tid_offset)
+
+    if remainder > 0.001:
+        partial_offset = full_copies * template_dur
+        partial_limit = partial_offset + remainder * template_dur
+        _emit_copy(events, zero_dur_ops, ops, base, partial_offset, stage, mb, phase,
+                   replicate, mult, fwd_lat, full_copies,
+                   time_limit=partial_limit, tid_offset=tid_offset)
+
+
+def _emit_copy(
+    events: list[dict],
+    zero_dur_ops: list[dict],
+    ops: list,
+    base: float,
+    offset: float,
+    stage: int,
+    mb: int,
+    phase: str,
+    replicate: bool,
+    mult: float,
+    fwd_lat: float,
+    layer_idx: int,
+    *,
+    time_limit: float | None = None,
+    tid_offset: int = 0,
+) -> None:
+    for op in ops:
+        if op.phase == "fwd" or not op.phase:
+            rel_start = offset + op.start_us
+        else:
+            rel_start = offset + (op.start_us - fwd_lat)
+
+        if rel_start < 0:
+            continue
+        if time_limit is not None and rel_start >= time_limit:
+            continue
+
+        if op.latency_us <= 0:
+            zero_dur_ops.append({
+                "op_type": op.op_type,
+                "stream_type": op.stream_type,
+                "phase": op.phase,
+                "node_id": op.node_id,
+                "mb": mb if replicate else -1,
+                "layer": layer_idx,
+            })
+            continue
+
+        dur_us = op.latency_us
+        if time_limit is not None:
+            end = rel_start + dur_us
+            if end > time_limit:
+                dur_us = max(0.0, time_limit - rel_start)
+                if dur_us <= 0:
+                    continue
+
+        cat = "communication" if op.stream_type == "comm" else "compute"
+        if replicate:
+            name = f"m{mb}:L{layer_idx}:{op.phase}:{op.op_type}" if op.phase else f"m{mb}:L{layer_idx}:{op.op_type}"
+        else:
+            name = f"L{layer_idx}:{op.phase}:{op.op_type}" if op.phase else f"L{layer_idx}:{op.op_type}"
+
+        events.append(ChromeTraceEvent(
+            name=name,
+            cat=cat,
+            pid=stage,
+            tid=tid_offset + (0 if op.stream_type != "comm" else 1),
+            ts=(base + rel_start) * mult,
+            dur=dur_us * mult,
+            args={
+                "phase": op.phase,
+                "op_type": op.op_type,
+                "stream_type": op.stream_type,
+                "mb": mb,
+                "layer": layer_idx,
+            },
+        ).to_dict())
+
+
 @dataclass
 class ChromeTraceEvent:
     """A single Chrome Trace complete event (ph="X")."""
@@ -118,11 +253,10 @@ class ChromeTraceExporter:
         are always in microseconds; ``ns`` multiplies by 1000.
     """
 
-    _MIN_VISIBLE_US = 1.0
-
     def __init__(self, time_unit: str = "us") -> None:
         self._mult = 1000.0 if time_unit == "ns" else 1.0
         self._time_unit = time_unit
+        self._zero_dur_ops: list[dict] = []
 
     # ── metadata helpers ──────────────────────────────────────────────────
 
@@ -281,7 +415,7 @@ class ChromeTraceExporter:
                 pid=pid,
                 tid=tid,
                 ts=task.start_us * self._mult,
-                dur=max(task.latency_us, self._MIN_VISIBLE_US) * self._mult,
+                dur=task.latency_us * self._mult,
                 color=color_val,
                 args={
                     "phase": task.phase,
@@ -347,10 +481,12 @@ class ChromeTraceExporter:
         events.extend(self._per_stage_meta_events(pp))
 
         grid_slot: dict[tuple[int, int, str], float] = {}
+        grid_window: dict[tuple[int, int, str], float] = {}
         if pp_stitched is not None and M > 1:
             for task in pp_stitched.tasks:
                 if task.phase in ("fwd", "bwd", "bwd_dx", "bwd_dw"):
                     grid_slot[(task.stage_id, task.mb_id, task.phase)] = task.start_us
+                    grid_window[(task.stage_id, task.mb_id, task.phase)] = task.latency_us
 
         for s, tl in enumerate(timelines):
             fwd_lat = tl.phase_latency("fwd")
@@ -359,45 +495,35 @@ class ChromeTraceExporter:
                 fwd_lat = tl.total_latency_us
             stage_total = fwd_lat + bwd_lat
 
+            fwd_ops = [op for op in tl.scheduled_ops if op.phase == "fwd" or not op.phase]
+            bwd_ops = [op for op in tl.scheduled_ops if op.phase and op.phase != "fwd"]
+
             num_replicas = M if replicate else 1
 
             for m in range(num_replicas):
                 fwd_base = grid_slot.get((s, m, "fwd"), m * stage_total)
+                fwd_win  = grid_window.get((s, m, "fwd"), fwd_lat)
                 bwd_base = grid_slot.get(
                     (s, m, "bwd"),
                     grid_slot.get((s, m, "bwd_dx"), m * stage_total + fwd_lat),
                 )
+                bwd_win  = grid_window.get(
+                    (s, m, "bwd"),
+                    grid_window.get((s, m, "bwd_dx"), bwd_lat),
+                )
 
-                for op in tl.scheduled_ops:
-                    cat = "communication" if op.stream_type == "comm" else "compute"
-                    if replicate:
-                        name = f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}"
-                    else:
-                        name = f"{op.phase}:{op.op_type}" if op.phase else op.op_type
+                # ── Fwd template replication ──
+                _emit_template_replicas(
+                    events, self._zero_dur_ops, fwd_ops, fwd_base, fwd_win, fwd_lat,
+                    s, m, "fwd", replicate, self._mult,
+                )
 
-                    if op.phase == "fwd" or not op.phase:
-                        base = fwd_base
-                        rel_start = op.start_us
-                    else:
-                        base = bwd_base
-                        rel_start = op.start_us - fwd_lat
-
-                    dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
-
-                    events.append(ChromeTraceEvent(
-                        name=name,
-                        cat=cat,
-                        pid=s,
-                        tid=op.stream_id,
-                        ts=(base + rel_start) * self._mult,
-                        dur=dur_us * self._mult,
-                        args={
-                            "phase": op.phase,
-                            "op_type": op.op_type,
-                            "stream_type": op.stream_type,
-                            "mb": m,
-                        },
-                    ).to_dict())
+                # ── Bwd template replication ──
+                _emit_template_replicas(
+                    events, self._zero_dur_ops, bwd_ops, bwd_base, bwd_win, bwd_lat,
+                    s, m, "bwd", replicate, self._mult,
+                    fwd_lat=fwd_lat,
+                )
 
         events = self._deduplicate(events)
         doc = self._build_doc(events)
@@ -442,7 +568,7 @@ class ChromeTraceExporter:
                 pid=pid,
                 tid=tid,
                 ts=task.start_us * self._mult,
-                dur=max(task.latency_us, self._MIN_VISIBLE_US) * self._mult,
+                dur=task.latency_us * self._mult,
                 color=self._color_for_task(task),
                 args={
                     "phase": task.phase,
@@ -456,16 +582,25 @@ class ChromeTraceExporter:
 
         for d, tl in enumerate(timelines):
             for op in tl.scheduled_ops:
+                if op.latency_us <= 0:
+                    self._zero_dur_ops.append({
+                        "op_type": op.op_type,
+                        "stream_type": op.stream_type,
+                        "phase": op.phase,
+                        "node_id": op.node_id,
+                        "mb": -1,
+                        "layer": -1,
+                    })
+                    continue
                 cat = "communication" if op.stream_type == "comm" else "compute"
                 name = f"{op.phase}:{op.op_type}" if op.phase else op.op_type
-                dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
                 events.append(ChromeTraceEvent(
                     name=name,
                     cat=cat,
                     pid=d,
-                    tid=detail_base + op.stream_id,
+                    tid=detail_base + (0 if op.stream_type != "comm" else 1),
                     ts=op.start_us * self._mult,
-                    dur=dur_us * self._mult,
+                    dur=op.latency_us * self._mult,
                     args={
                         "phase": op.phase,
                         "op_type": op.op_type,
@@ -507,9 +642,11 @@ class ChromeTraceExporter:
         ))
 
         grid_index: dict[tuple[int, int, str], float] = {}
+        grid_windows: dict[tuple[int, int, str], float] = {}
         for task in stitched.tasks:
             key = (task.stage_id, task.mb_id, task.phase)
             grid_index[key] = task.start_us
+            grid_windows[key] = task.latency_us
 
         for task in stitched.tasks:
             pid = task.stream_id
@@ -520,7 +657,7 @@ class ChromeTraceExporter:
                 pid=pid,
                 tid=tid,
                 ts=task.start_us * self._mult,
-                dur=max(task.latency_us, self._MIN_VISIBLE_US) * self._mult,
+                dur=task.latency_us * self._mult,
                 color=self._color_for_task(task),
                 args={
                     "phase": task.phase, "mb": task.mb_id,
@@ -532,57 +669,34 @@ class ChromeTraceExporter:
             fwd_lat = tl.phase_latency("fwd")
             bwd_lat = tl.phase_latency("bwd")
 
-            # Index compute ops by node_id for CoC start-time shift
-            compute_index: dict[str, tuple[float, float]] = {}
-            for op in tl.scheduled_ops:
-                if op.stream_type != "comm":
-                    compute_index[op.node_id] = (op.start_us, op.latency_us)
+            fwd_ops = [op for op in tl.scheduled_ops if op.phase == "fwd" or not op.phase]
+            bwd_ops = [op for op in tl.scheduled_ops if op.phase and op.phase != "fwd"]
 
             for m in range(stitched.M):
                 fwd_base = grid_index.get((d, m, "fwd"), 0.0)
-                for op in tl.scheduled_ops:
-                    if op.phase == "fwd":
-                        dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
-                        ts = (fwd_base + op.start_us) * self._mult
-                        if op.overlap_type not in ("none", "") and op.overlap_target:
-                            ts = self._shift_overlap_comm_op(op, compute_index, fwd_base, ts)
-                        events.append(ChromeTraceEvent(
-                            name=f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
-                            cat="compute" if op.stream_type != "comm" else "communication",
-                            pid=d,
-                            tid=detail_base + op.stream_id,
-                            ts=ts,
-                            dur=dur_us * self._mult,
-                            args={
-                                "phase": "fwd",
-                                "mb": m,
-                                "op_type": op.op_type,
-                                "view": "detail",
-                            },
-                        ).to_dict())
+                fwd_win  = grid_windows.get((d, m, "fwd"), fwd_lat)
+                bwd_base = grid_index.get(
+                    (d, m, "bwd"),
+                    grid_index.get((d, m, "bwd_dx"), 0.0),
+                )
+                bwd_win  = grid_windows.get(
+                    (d, m, "bwd"),
+                    grid_windows.get((d, m, "bwd_dx"), bwd_lat),
+                )
 
-                bwd_base = grid_index.get((d, m, "bwd"), grid_index.get((d, m, "bwd_dx"), 0.0))
-                for op in tl.scheduled_ops:
-                    if "bwd" in op.phase:
-                        dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
-                        relative_start = op.start_us - fwd_lat if len(op.phase) > 0 and "fwd" not in op.phase else op.start_us
-                        ts = (bwd_base + relative_start) * self._mult
-                        if op.overlap_type not in ("none", "") and op.overlap_target:
-                            ts = self._shift_overlap_comm_op(op, compute_index, bwd_base, ts)
-                        events.append(ChromeTraceEvent(
-                            name=f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
-                            cat="compute" if op.stream_type != "comm" else "communication",
-                            pid=d,
-                            tid=detail_base + op.stream_id,
-                            ts=ts,
-                            dur=dur_us * self._mult,
-                            args={
-                                "phase": "bwd",
-                                "mb": m,
-                                "op_type": op.op_type,
-                                "view": "detail",
-                            },
-                        ).to_dict())
+                # ── Fwd template replication ──
+                _emit_template_replicas(
+                    events, self._zero_dur_ops, fwd_ops, fwd_base, fwd_win, fwd_lat,
+                    d, m, "fwd", True, self._mult,
+                    tid_offset=detail_base,
+                )
+
+                # ── Bwd template replication ──
+                _emit_template_replicas(
+                    events, self._zero_dur_ops, bwd_ops, bwd_base, bwd_win, bwd_lat,
+                    d, m, "bwd", True, self._mult,
+                    fwd_lat=fwd_lat, tid_offset=detail_base,
+                )
 
         doc = self._build_doc(events)
         if path:
@@ -715,14 +829,23 @@ class ChromeTraceExporter:
         }
 
     def _build_doc(self, events: list[dict]) -> str:
-        return json.dumps(
-            {
-                "traceEvents": events,
-                "displayTimeUnit": "ns" if self._time_unit == "ns" else "ms",
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
+        result: dict = {
+            "traceEvents": events,
+            "displayTimeUnit": "ns" if self._time_unit == "ns" else "ms",
+        }
+        if self._zero_dur_ops:
+            from collections import Counter
+            by_op_type = Counter(op["op_type"] for op in self._zero_dur_ops)
+            by_phase = Counter(op["phase"] for op in self._zero_dur_ops)
+            by_stream = Counter(op["stream_type"] for op in self._zero_dur_ops)
+            result["zeroDurOps"] = {
+                "total": len(self._zero_dur_ops),
+                "byOpType": dict(by_op_type.most_common()),
+                "byPhase": dict(by_phase),
+                "byStreamType": dict(by_stream),
+            }
+            self._zero_dur_ops = []
+        return json.dumps(result, indent=2, ensure_ascii=False)
 
     @staticmethod
     def _write(path: str, content: str) -> None:

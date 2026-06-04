@@ -1,11 +1,14 @@
 """Analysis passes (Stage 4): FLOPs annotation, Roofline, and Stream assignment."""
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING
 
 from python.zrt.transform.base import GraphPass
 from python.zrt.transform.training.recompute import is_external_recompute_node
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from python.zrt.ir.graph import OpGraph

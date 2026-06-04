@@ -645,6 +645,7 @@ def run_trace_phases(
     graph_mode: bool = False,
     gradient_checkpointing: bool = False,
     infer_profile: bool = False,
+    full_trace: bool = False,
 ) -> Tuple[Path, Dict[str, List[Dict[str, Any]]]]:
     """Load *model_id* once, trace each requested phase, write separate files.
 
@@ -751,7 +752,17 @@ def run_trace_phases(
     if full_compress_ratios:
         cfg_tmp._full_compress_ratios = full_compress_ratios
     
-    if infer_profile and target_layers is None:
+    if full_trace:
+        # Trace every layer — skip LayerProfile inference entirely.
+        # target_layers covers all indices so RecordingDispatch captures
+        # every layer's ops.
+        target_layers = list(range(full_num_layers))
+        effective_num_layers = full_num_layers
+        logger.info(
+            "Full trace: loading all %d layers (no LayerProfile sampling)",
+            full_num_layers,
+        )
+    elif infer_profile and target_layers is None:
         # New LayerProfile-based inference (supports V4 CSA/HCA/SWA)
         # Infer profile from FULL config (before truncation)
         profile = infer_layer_profile(cfg_tmp)

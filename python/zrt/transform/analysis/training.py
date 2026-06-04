@@ -671,16 +671,11 @@ class TrainingPipelinePass(GraphPass):
             # Step 2: homogeneous fallback when too few traced layers cover all pp stages.
             # E.g. DeepSeek-V3 with --layers 4 traces only 2 representative layers but
             # pp=4, so stages 2-3 are empty. Distribute total evenly across all stages.
-            # OR when stage_fwd distribution is severely imbalanced (ratio > 5x).
+            # Also triggered when layer_type_scaling is active: the per-stage DAGScheduler
+            # output reflects only the traced layers (e.g. 5) rather than the full model
+            # (e.g. 61), so the layer-type data is a better basis for per-stage fwd/bwd.
             stages_with_fwd = sum(1 for s in range(pp) if stage_fwd.get(s, 0.0) > 0)
-            
-            # Check for severe imbalance
-            fwd_values = [stage_fwd.get(s, 0.0) for s in range(pp)]
-            max_fwd = max(fwd_values) if fwd_values else 0.0
-            min_fwd = min(v for v in fwd_values if v > 0) if any(v > 0 for v in fwd_values) else 0.0
-            fwd_imbalance_ratio = max_fwd / min_fwd if min_fwd > 0 else 0.0
-            
-            needs_fallback = (0 < stages_with_fwd < pp) or (fwd_imbalance_ratio > 5.0)
+            needs_fallback = (0 < stages_with_fwd < pp) or use_layer_type_scaling
             
             if needs_fallback:
                 # FIX: Use per-layer latency to compute total, then uniform distribution
@@ -1428,6 +1423,10 @@ class TrainingPipelinePass(GraphPass):
             if _is_recompute_node(node):
                 base_lat = node.annotations.get("base_latency_us", latency)
                 layer_recompute_total[layer_idx] += base_lat
+                # Recompute forward nodes still execute real forward work during
+                # the PP warmup phase — count their base latency in fwd_total as
+                # well so PPStitcher can model warmup/steady/cooldown correctly.
+                layer_fwd_total[layer_idx] += base_lat
             elif _is_bwd_node(node):
                 layer_bwd_total[layer_idx] += latency
             else:
